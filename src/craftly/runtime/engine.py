@@ -9,6 +9,8 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
+from src.craftly.gateway.api import resolve_registered_repo_path
+
 from pydantic import Field
 
 from src.craftly.db import LocalStore
@@ -527,7 +529,7 @@ class CraftlyRuntime:
                 request.prompt, top_k=request.max_agent_nodes or 4
             )
             store = LocalStore()
-            workspace = str(Path(request.workspace).resolve())
+            workspace = str(resolve_registered_repo_path(request.workspace))
             project = store.create_project(
                 name=f"runtime-{time.time_ns()}", repo_path=workspace
             )
