@@ -487,3 +487,568 @@ def evaluate_continual_perplexity(
         general_retention_score=round(retention_score, 2),
         evaluated_tasks_count=len(tasks_to_eval),
     )
+
+
+# ---------------------------------------------------------------------------
+# 5. Multi-Domain Sequential Benchmark Matrix & Transfer Metrics
+# ---------------------------------------------------------------------------
+
+class SequentialDomain(StrictModel):
+    domain_id: str
+    name: str
+    description: str
+    tasks: list[ForgettingTask]
+
+
+CANONICAL_SEQUENTIAL_DOMAINS: list[SequentialDomain] = [
+    SequentialDomain(
+        domain_id="domain_a_algorithms",
+        name="Domain A: Core Algorithms & Data Structures",
+        description="Fundamental algorithmic logic, sorting, searching, caching, and tree traversal.",
+        tasks=[
+            ForgettingTask(
+                task_id="algo-quicksort",
+                category="domain_a_algorithms",
+                prompt="def quicksort(arr: list[int]) -> list[int]:\n    \"\"\"Sort array using quicksort.\"\"\"\n",
+                expected_patterns=["pivot", "quicksort", "return"],
+            ),
+            ForgettingTask(
+                task_id="algo-binary-search",
+                category="domain_a_algorithms",
+                prompt="def binary_search(elements: list[int], target: int) -> int:\n    \"\"\"Find target index in sorted list.\"\"\"\n",
+                expected_patterns=["mid", "low", "high", "return"],
+            ),
+            ForgettingTask(
+                task_id="algo-lru-cache",
+                category="domain_a_algorithms",
+                prompt="class LRUCache:\n    def __init__(self, capacity: int):\n",
+                expected_patterns=["capacity", "get", "put"],
+            ),
+        ],
+    ),
+    SequentialDomain(
+        domain_id="domain_b_systems",
+        name="Domain B: Systems, Web APIs & Serialization",
+        description="System services, HTTP handlers, streaming, and manifest serialization.",
+        tasks=[
+            ForgettingTask(
+                task_id="sys-http-handler",
+                category="domain_b_systems",
+                prompt="import http.server\nclass HealthServer(http.server.BaseHTTPRequestHandler):\n    def do_GET(self):\n",
+                expected_patterns=["send_response", "end_headers", "wfile.write"],
+            ),
+            ForgettingTask(
+                task_id="sys-json-parser",
+                category="domain_b_systems",
+                prompt="import json\ndef parse_manifest_safe(raw_bytes: bytes) -> dict:\n",
+                expected_patterns=["json.loads", "decode", "return"],
+            ),
+            ForgettingTask(
+                task_id="sys-atomic-write",
+                category="domain_b_systems",
+                prompt="import os, tempfile\ndef write_atomic(path: str, data: str) -> None:\n",
+                expected_patterns=["tempfile", "replace", "os."],
+            ),
+        ],
+    ),
+    SequentialDomain(
+        domain_id="domain_c_defensive_security",
+        name="Domain C: Defensive Security & Vulnerability Patching",
+        description="Defensive remediation, SQL injection prevention, constant-time cryptography, path sanitation.",
+        tasks=[
+            ForgettingTask(
+                task_id="sec-cwe-89-sqli",
+                category="domain_c_defensive_security",
+                prompt="def query_user_secure(cursor, user_id: int):\n    \"\"\"Execute query hardened against CWE-89.\"\"\"\n",
+                expected_patterns=["SELECT", "%s", "cursor.execute"],
+            ),
+            ForgettingTask(
+                task_id="sec-cwe-22-path",
+                category="domain_c_defensive_security",
+                prompt="from pathlib import Path\ndef resolve_sandboxed_path(root: Path, target: str) -> Path:\n    \"\"\"Prevent CWE-22 traversal.\"\"\"\n",
+                expected_patterns=["resolve", "is_relative_to"],
+            ),
+            ForgettingTask(
+                task_id="sec-cwe-208-timing",
+                category="domain_c_defensive_security",
+                prompt="import hmac\ndef verify_auth_token_timing_safe(expected: bytes, given: bytes) -> bool:\n",
+                expected_patterns=["hmac.compare_digest"],
+            ),
+        ],
+    ),
+    SequentialDomain(
+        domain_id="domain_d_agentic_patching",
+        name="Domain D: Agentic Code Modification & Unified Patching",
+        description="Syntactic unified diff generation, lint error resolution, and AST-guided editing.",
+        tasks=[
+            ForgettingTask(
+                task_id="agent-diff-hunk",
+                category="domain_d_agentic_patching",
+                prompt="def format_unified_diff(original: str, modified: str, filename: str) -> str:\n",
+                expected_patterns=["---", "+++", "@@"],
+            ),
+            ForgettingTask(
+                task_id="agent-patch-validator",
+                category="domain_d_agentic_patching",
+                prompt="import ast\ndef validate_python_syntax(code_str: str) -> bool:\n",
+                expected_patterns=["ast.parse", "SyntaxError", "return"],
+            ),
+            ForgettingTask(
+                task_id="agent-lint-filter",
+                category="domain_d_agentic_patching",
+                prompt="def filter_actionable_lints(raw_issues: list[dict]) -> list[dict]:\n",
+                expected_patterns=["severity", "error", "return"],
+            ),
+        ],
+    ),
+]
+
+
+class SequentialTransferMetrics(StrictModel):
+    """Scientific Continual Learning transfer and retention metrics matrix."""
+    domain_names: list[str]
+    transfer_matrix: list[list[float]] = Field(description="R[i][j]: loss on domain j after completing training on domain i")
+    backward_transfer: float = Field(description="Mean BWT: negative implies catastrophic forgetting")
+    forward_transfer: float = Field(description="Mean FWT: positive implies constructive transfer")
+    average_forgetting: float = Field(description="Mean degradation from peak performance on prior domains")
+    retention_rates: dict[str, float] = Field(description="Per-domain retention percentage relative to baseline/peak")
+    per_domain_losses: dict[str, float]
+    per_domain_perplexities: dict[str, float]
+    created_at_utc: str = Field(default_factory=lambda: time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()))
+
+
+def compute_sequential_metrics(
+    transfer_matrix: list[list[float]],
+    domain_names: list[str],
+    baseline_losses: list[float] | None = None,
+) -> SequentialTransferMetrics:
+    """Calculate Backward Transfer (BWT), Forward Transfer (FWT), and Forgetting Rate.
+
+    Formulas:
+        BWT = 1/(T-1) * sum_{i=1}^{T-1} ( R[T-1][i] - R[i][i] )
+              (Note: using negative loss difference so higher is better: loss_i_i - loss_T_i)
+        FWT = 1/(T-1) * sum_{i=1}^{T-1} ( baseline[i] - R[i-1][i] )
+        Forgetting_k = max_{t < T} ( loss_{T, k} - loss_{t, k} )
+    """
+    t_count = len(transfer_matrix)
+    if t_count == 0 or len(domain_names) != t_count:
+        raise ValueError(f"Matrix dimension ({t_count}) must match domain count ({len(domain_names)})")
+
+    # Final stage evaluation losses
+    final_losses = transfer_matrix[-1]
+
+    # Backward Transfer: difference between final performance on task i and performance right after training task i
+    bwt_vals: list[float] = []
+    forgetting_vals: list[float] = []
+    retention_rates: dict[str, float] = {}
+
+    for i in range(t_count - 1):
+        loss_at_completion = transfer_matrix[i][i]
+        loss_final = final_losses[i]
+        # In loss terms: positive delta means loss went UP (forgetting occurred)
+        degradation = loss_final - loss_at_completion
+        forgetting_vals.append(max(0.0, degradation))
+        # BWT: conventionally higher is better (positive = improved, negative = forgot)
+        bwt_vals.append(-degradation)
+
+        # Retention percentage: 100 * (peak / current) in score space
+        score_init = 100.0 / (1.0 + max(0.001, loss_at_completion))
+        score_final = 100.0 / (1.0 + max(0.001, loss_final))
+        ret_pct = (score_final / max(0.001, score_init)) * 100.0
+        retention_rates[domain_names[i]] = round(min(150.0, max(0.0, ret_pct)), 2)
+
+    retention_rates[domain_names[-1]] = 100.0  # Just trained domain has 100% relative retention
+
+    mean_bwt = sum(bwt_vals) / len(bwt_vals) if bwt_vals else 0.0
+    mean_forgetting = sum(forgetting_vals) / len(forgetting_vals) if forgetting_vals else 0.0
+
+    # Forward Transfer: comparing zero-shot performance prior to training domain i against baseline
+    fwt_vals: list[float] = []
+    if baseline_losses and len(baseline_losses) == t_count:
+        for i in range(1, t_count):
+            zero_shot_loss = transfer_matrix[i - 1][i]
+            base_loss = baseline_losses[i]
+            # If zero-shot loss is lower than raw base, positive transfer occurred
+            fwt_vals.append(base_loss - zero_shot_loss)
+
+    mean_fwt = sum(fwt_vals) / len(fwt_vals) if fwt_vals else 0.0
+
+    per_domain_losses = {domain_names[idx]: round(final_losses[idx], 4) for idx in range(t_count)}
+    per_domain_ppls = {
+        domain_names[idx]: round(math.exp(min(20.0, final_losses[idx])), 2) for idx in range(t_count)
+    }
+
+    return SequentialTransferMetrics(
+        domain_names=domain_names,
+        transfer_matrix=[[round(val, 4) for val in row] for row in transfer_matrix],
+        backward_transfer=round(mean_bwt, 4),
+        forward_transfer=round(mean_fwt, 4),
+        average_forgetting=round(mean_forgetting, 4),
+        retention_rates=retention_rates,
+        per_domain_losses=per_domain_losses,
+        per_domain_perplexities=per_domain_ppls,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 6. Mechanistic Diagnostics: Why Does the Model Forget?
+# ---------------------------------------------------------------------------
+
+class LayerDisplacementReport(StrictModel):
+    """Detailed layer-wise parameter drift analysis."""
+    embedding_drift: float = Field(description="Relative Frobenius displacement of token embeddings")
+    attention_drift: float = Field(description="Mean relative displacement of QKVO attention projection weights")
+    ffn_drift: float = Field(description="Mean relative displacement of MLP / feed-forward layers")
+    head_drift: float = Field(description="Relative displacement of LM output head / norm")
+    layer_drifts: dict[str, float] = Field(description="Individual parameter tensor relative drifts")
+    mean_total_drift: float = Field(description="Global mean parameter displacement")
+    max_drift_parameter: str = Field(description="Parameter tensor undergoing maximal displacement")
+    max_drift_value: float = Field(description="Maximal relative displacement value")
+
+
+class LayerwiseDriftAnalyzer:
+    """Computes relative parameter drift: ||theta_t - theta_0||_F / (||theta_0||_F + eps)."""
+
+    @staticmethod
+    def compute_drift(
+        base_state: dict[str, Any],
+        current_state: dict[str, Any],
+        eps: float = 1e-8,
+    ) -> LayerDisplacementReport:
+        require_torch()
+        drifts: dict[str, float] = {}
+
+        emb_drifts: list[float] = []
+        attn_drifts: list[float] = []
+        ffn_drifts: list[float] = []
+        head_drifts: list[float] = []
+
+        for name, base_param in base_state.items():
+            if name not in current_state:
+                continue
+            curr_param = current_state[name]
+            if not isinstance(base_param, torch.Tensor) or not isinstance(curr_param, torch.Tensor):
+                continue
+
+            diff = (curr_param.float() - base_param.float())
+            norm_base = torch.norm(base_param.float()).item()
+            norm_diff = torch.norm(diff).item()
+            rel_drift = norm_diff / max(eps, norm_base)
+
+            drifts[name] = round(rel_drift, 6)
+
+            # Categorize layer type
+            lower_name = name.lower()
+            if "embed" in lower_name or "wte" in lower_name:
+                emb_drifts.append(rel_drift)
+            elif any(k in lower_name for k in ["q_proj", "k_proj", "v_proj", "o_proj", "attn"]):
+                attn_drifts.append(rel_drift)
+            elif any(k in lower_name for k in ["mlp", "ffn", "intermediate", "down_proj", "up_proj"]):
+                ffn_drifts.append(rel_drift)
+            elif any(k in lower_name for k in ["head", "lm_head", "output"]):
+                head_drifts.append(rel_drift)
+
+        mean_emb = sum(emb_drifts) / len(emb_drifts) if emb_drifts else 0.0
+        mean_attn = sum(attn_drifts) / len(attn_drifts) if attn_drifts else 0.0
+        mean_ffn = sum(ffn_drifts) / len(ffn_drifts) if ffn_drifts else 0.0
+        mean_head = sum(head_drifts) / len(head_drifts) if head_drifts else 0.0
+
+        all_vals = list(drifts.values())
+        mean_tot = sum(all_vals) / len(all_vals) if all_vals else 0.0
+
+        max_param = max(drifts, key=drifts.get) if drifts else "none"
+        max_val = drifts.get(max_param, 0.0)
+
+        return LayerDisplacementReport(
+            embedding_drift=round(mean_emb, 6),
+            attention_drift=round(mean_attn, 6),
+            ffn_drift=round(mean_ffn, 6),
+            head_drift=round(mean_head, 6),
+            layer_drifts=drifts,
+            mean_total_drift=round(mean_tot, 6),
+            max_drift_parameter=max_param,
+            max_drift_value=round(max_val, 6),
+        )
+
+
+class RepresentationDriftReport(StrictModel):
+    mean_cosine_similarity: float = Field(description="Average cosine similarity of hidden states across probe tasks")
+    layer_cosine_similarities: dict[int, float] = Field(description="Layer-wise cosine similarity profile")
+
+
+class RepresentationDriftAnalyzer:
+    """Measures latent representational alignment across transformer layers."""
+
+    @staticmethod
+    def compute_hidden_drift(
+        model_base: Any,
+        model_current: Any,
+        input_ids: Any,
+    ) -> RepresentationDriftReport:
+        require_torch()
+        model_base.eval()
+        model_current.eval()
+
+        layer_cosines: dict[int, float] = {}
+
+        with torch.no_grad():
+            # Get intermediate representations via forward hook or standard hidden states
+            out_base = model_base(input_ids)
+            out_curr = model_current(input_ids)
+
+            logits_base = out_base.logits.float()
+            logits_curr = out_curr.logits.float()
+
+            cos_sim = F.cosine_similarity(logits_base.view(-1, logits_base.size(-1)), logits_curr.view(-1, logits_curr.size(-1)), dim=-1)
+            mean_cos = float(cos_sim.mean().item())
+            layer_cosines[0] = round(mean_cos, 4)
+
+        return RepresentationDriftReport(
+            mean_cosine_similarity=round(mean_cos, 4),
+            layer_cosine_similarities=layer_cosines,
+        )
+
+
+class GradientConflictAnalyzer:
+    """Measures gradient direction alignment between new task loss and reference replay loss."""
+
+    @staticmethod
+    def compute_gradient_cosine(
+        model: Any,
+        task_loss: Any,
+        replay_loss: Any,
+    ) -> float:
+        require_torch()
+        model.zero_grad()
+        task_loss.backward(retain_graph=True)
+        grads_task = [p.grad.flatten().clone() for p in model.parameters() if p.grad is not None]
+
+        model.zero_grad()
+        replay_loss.backward(retain_graph=True)
+        grads_replay = [p.grad.flatten().clone() for p in model.parameters() if p.grad is not None]
+
+        model.zero_grad()
+
+        if not grads_task or not grads_replay:
+            return 1.0
+
+        vec_task = torch.cat(grads_task)
+        vec_replay = torch.cat(grads_replay)
+
+        norm_t = torch.norm(vec_task)
+        norm_r = torch.norm(vec_replay)
+        if norm_t < 1e-8 or norm_r < 1e-8:
+            return 0.0
+
+        cos_sim = torch.dot(vec_task, vec_replay) / (norm_t * norm_r)
+        return float(cos_sim.item())
+
+
+# ---------------------------------------------------------------------------
+# 7. Early Warning & Forgetting Detection
+# ---------------------------------------------------------------------------
+
+class EarlyWarningSignal(StrictModel):
+    warning_triggered: bool
+    risk_level: Literal["LOW", "MODERATE", "CRITICAL"]
+    drift_velocity: float
+    indicators: list[str] = Field(default_factory=list)
+    recommended_action: str
+
+
+class EarlyForgettingDetector:
+    """Monitors parameter displacement velocity and loss spikes to detect catastrophic collapse early."""
+
+    def __init__(
+        self,
+        drift_threshold: float = 0.08,
+        velocity_threshold: float = 0.03,
+    ) -> None:
+        self.drift_threshold = drift_threshold
+        self.velocity_threshold = velocity_threshold
+        self.history: list[dict[str, float]] = []
+
+    def evaluate_step(
+        self,
+        step: int,
+        drift_report: LayerDisplacementReport,
+        reference_probe_loss: float,
+    ) -> EarlyWarningSignal:
+        current_drift = drift_report.mean_total_drift
+        prev_drift = self.history[-1]["drift"] if self.history else current_drift
+        velocity = current_drift - prev_drift
+
+        self.history.append({"step": float(step), "drift": current_drift, "loss": reference_probe_loss})
+
+        indicators: list[str] = []
+        risk: Literal["LOW", "MODERATE", "CRITICAL"] = "LOW"
+        action = "Maintain scheduled learning rate."
+
+        # Check 1: Embedding or Attention layer excessive drift
+        if drift_report.embedding_drift > self.drift_threshold * 1.5:
+            indicators.append(f"Embedding drift elevated ({drift_report.embedding_drift:.4f} > {self.drift_threshold * 1.5:.4f})")
+            risk = "MODERATE"
+
+        # Check 2: High displacement acceleration
+        if velocity > self.velocity_threshold:
+            indicators.append(f"Parameter displacement velocity high ({velocity:.4f} / step)")
+            risk = "CRITICAL" if risk == "MODERATE" else "MODERATE"
+
+        # Check 3: Reference loss divergence
+        if len(self.history) >= 2:
+            base_loss = self.history[0]["loss"]
+            if reference_probe_loss > base_loss * 1.35:
+                indicators.append(f"Reference retention loss inflated by {((reference_probe_loss / max(0.001, base_loss)) - 1.0):+.1%}")
+                risk = "CRITICAL"
+
+        if risk == "CRITICAL":
+            action = "Trigger emergency experience replay boost (+15%) and decrease active learning rate by 50%."
+        elif risk == "MODERATE":
+            action = "Enable reference policy KL constraint or increase weight decay."
+
+        return EarlyWarningSignal(
+            warning_triggered=(risk != "LOW"),
+            risk_level=risk,
+            drift_velocity=round(velocity, 6),
+            indicators=indicators,
+            recommended_action=action,
+        )
+
+
+# ---------------------------------------------------------------------------
+# 8. Elastic Weight Consolidation (EWC)
+# ---------------------------------------------------------------------------
+
+class ElasticWeightConsolidation:
+    """Diagonal Fisher Information-weighted quadratic regularization penalty."""
+
+    def __init__(self, ewc_lambda: float = 100.0) -> None:
+        self.ewc_lambda = max(0.0, ewc_lambda)
+
+    @classmethod
+    def estimate_diagonal_fisher(
+        cls,
+        model: Any,
+        samples: list[str],
+        tokenizer: Any,
+        device: str = "cpu",
+        max_sequence_length: int = 128,
+    ) -> dict[str, Any]:
+        """Compute empirical diagonal Fisher information on domain reference samples."""
+        require_torch()
+        model.eval()
+        fisher_diag: dict[str, Any] = {
+            name: torch.zeros_like(param, device=device)
+            for name, param in model.named_parameters()
+            if param.requires_grad
+        }
+
+        total_samples = 0
+        for text in samples:
+            tokens = tokenizer.encode(text).ids
+            if len(tokens) < 2:
+                continue
+            if len(tokens) > max_sequence_length:
+                tokens = tokens[:max_sequence_length]
+
+            inp = torch.tensor([tokens[:-1]], dtype=torch.long, device=device)
+            target = torch.tensor([tokens[1:]], dtype=torch.long, device=device)
+
+            model.zero_grad()
+            out = model(inp, labels=target)
+            loss = out.loss
+            loss.backward()
+
+            for name, param in model.named_parameters():
+                if param.grad is not None and name in fisher_diag:
+                    fisher_diag[name] += param.grad.data.pow(2)
+
+            total_samples += 1
+
+        if total_samples > 0:
+            for name in fisher_diag:
+                fisher_diag[name] /= total_samples
+
+        return fisher_diag
+
+    def compute_penalty(
+        self,
+        model: Any,
+        optimal_state_dict: dict[str, Any],
+        fisher_diag: dict[str, Any],
+    ) -> Any:
+        """Compute EWC loss: (lambda / 2) * sum_i F_i * (theta_i - theta_opt_i)^2."""
+        require_torch()
+        loss = torch.tensor(0.0, device=next(model.parameters()).device)
+        if self.ewc_lambda <= 0.0:
+            return loss
+
+        for name, param in model.named_parameters():
+            if name in optimal_state_dict and name in fisher_diag:
+                opt_val = optimal_state_dict[name].to(param.device)
+                f_val = fisher_diag[name].to(param.device)
+                loss += (f_val * (param - opt_val).pow(2)).sum()
+
+        return 0.5 * self.ewc_lambda * loss
+
+
+# ---------------------------------------------------------------------------
+# 9. Proposed Method: Geometry-Aware Dynamic Replay & Layer Anchoring (GD-LSA)
+# ---------------------------------------------------------------------------
+
+class GeometryAwareLayerAnchor:
+    """Craftly Proposed Anti-Forgetting Technique (GD-LSA).
+
+    Dynamically modulates parameter stiffness and replay allocation:
+    1. Lower layers (Token Embeddings & Initial Attention) maintain high rigidity
+       to protect core algorithmic primitives.
+    2. Higher layers (MLP & Domain Projections) have selective plasticity
+       to allow new domain acquisition without gradient interference.
+    3. Replay ratio dynamically increases when parameter drift velocity rises.
+    """
+
+    def __init__(
+        self,
+        base_replay_ratio: float = 0.15,
+        max_replay_ratio: float = 0.40,
+        anchor_stiffness: float = 0.5,
+    ) -> None:
+        self.base_replay_ratio = base_replay_ratio
+        self.max_replay_ratio = max_replay_ratio
+        self.anchor_stiffness = anchor_stiffness
+
+    def compute_layer_weight(self, param_name: str, total_layers: int = 4) -> float:
+        """Assign layer-dependent stiffness weight (higher for early layers)."""
+        lower = param_name.lower()
+        if "embed" in lower or "wte" in lower:
+            return 2.5 * self.anchor_stiffness
+        if "head" in lower or "lm_head" in lower:
+            return 1.8 * self.anchor_stiffness
+
+        # Extract layer index if present
+        for idx in range(total_layers):
+            if f"layers.{idx}." in lower or f"layer.{idx}." in lower:
+                # Linear decay of stiffness: earlier layers are stiffer
+                decay = 1.0 - (idx / max(1, total_layers))
+                return (1.0 + decay) * self.anchor_stiffness
+
+        return 1.0 * self.anchor_stiffness
+
+    def compute_loss(
+        self,
+        model: Any,
+        base_state_dict: dict[str, Any],
+    ) -> Any:
+        require_torch()
+        loss = torch.tensor(0.0, device=next(model.parameters()).device)
+        for name, param in model.named_parameters():
+            if name in base_state_dict:
+                stiffness = self.compute_layer_weight(name)
+                base_val = base_state_dict[name].to(param.device)
+                loss += stiffness * (param.float() - base_val.float()).pow(2).sum()
+        return loss
+
+    def get_dynamic_replay_ratio(self, drift_velocity: float) -> float:
+        """Scale replay ratio in response to parameter velocity."""
+        ratio = self.base_replay_ratio + (drift_velocity * 2.0)
+        return float(min(self.max_replay_ratio, max(self.base_replay_ratio, ratio)))

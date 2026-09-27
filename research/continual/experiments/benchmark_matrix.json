@@ -1,0 +1,61 @@
+{
+  "benchmark_title": "Craftly Multi-Domain Continual Learning & Forgetting Matrix",
+  "domains": [
+    {"domain_id": "domain_a_algorithms", "order": 0, "name": "Algorithms & Data Structures"},
+    {"domain_id": "domain_b_systems", "order": 1, "name": "Systems & Web APIs"},
+    {"domain_id": "domain_c_defensive_security", "order": 2, "name": "Defensive Security"},
+    {"domain_id": "domain_d_agentic_patching", "order": 3, "name": "Agentic Patching"}
+  ],
+  "conditions": [
+    {
+      "method_id": "naive_sequential",
+      "name": "Naive Sequential Training (Unconstrained Baseline)",
+      "replay_ratio": 0.0,
+      "kl_penalty_weight": 0.0,
+      "ewc_lambda": 0.0,
+      "slerp_merge": false
+    },
+    {
+      "method_id": "experience_replay",
+      "name": "Exemplar Memory Replay",
+      "replay_ratio": 0.20,
+      "kl_penalty_weight": 0.0,
+      "ewc_lambda": 0.0,
+      "slerp_merge": false
+    },
+    {
+      "method_id": "kl_anchor",
+      "name": "Reference Model Policy Regularization",
+      "replay_ratio": 0.0,
+      "kl_penalty_weight": 0.50,
+      "ewc_lambda": 0.0,
+      "slerp_merge": false
+    },
+    {
+      "method_id": "ewc",
+      "name": "Elastic Weight Consolidation (Fisher Penalty)",
+      "replay_ratio": 0.0,
+      "kl_penalty_weight": 0.0,
+      "ewc_lambda": 100.0,
+      "slerp_merge": false
+    },
+    {
+      "method_id": "slerp_merge",
+      "name": "Weight Space Merging (SLERP)",
+      "replay_ratio": 0.0,
+      "kl_penalty_weight": 0.0,
+      "ewc_lambda": 0.0,
+      "slerp_merge": true,
+      "slerp_t": 0.25
+    },
+    {
+      "method_id": "proposed_gd_lsa",
+      "name": "Geometry-Aware Dynamic Replay & Layer-Selective Anchoring (Proposed)",
+      "replay_ratio": 0.20,
+      "kl_penalty_weight": 0.0,
+      "ewc_lambda": 0.0,
+      "slerp_merge": false,
+      "anchor_stiffness": 0.50
+    }
+  ]
+}

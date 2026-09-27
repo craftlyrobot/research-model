@@ -10,9 +10,15 @@ from pathlib import Path
 
 from src.craftly.learning.continual import (
     CANONICAL_FORGETTING_SUITE,
+    CANONICAL_SEQUENTIAL_DOMAINS,
+    EarlyForgettingDetector,
+    ElasticWeightConsolidation,
     ExperienceReplayBuffer,
+    GeometryAwareLayerAnchor,
+    LayerwiseDriftAnalyzer,
     ReferenceModelKLLoss,
     WeightMerger,
+    compute_sequential_metrics,
     evaluate_continual_perplexity,
 )
 from src.craftly.model_ops.foundation import ScratchDecoderConfig
@@ -151,6 +157,96 @@ class TestContinualLearning(unittest.TestCase):
         self.assertGreater(report.perplexity_general, 0.0)
         self.assertGreaterEqual(report.general_retention_score, 0.0)
         self.assertLessEqual(report.general_retention_score, 100.0)
+
+    def test_sequential_domains_and_transfer_metrics(self) -> None:
+        self.assertEqual(len(CANONICAL_SEQUENTIAL_DOMAINS), 4)
+        domain_names = [d.name for d in CANONICAL_SEQUENTIAL_DOMAINS]
+
+        # Simulated transfer matrix: R[i][j]
+        # Stage 0: trained only on A
+        # Stage 1: trained on B -> A loss increases (forgetting)
+        # Stage 2: trained on C -> A, B losses increase
+        # Stage 3: trained on D -> A, B, C losses increase
+        mock_matrix = [
+            [1.20, 2.80, 3.10, 3.50],
+            [1.50, 1.10, 2.90, 3.20],
+            [1.80, 1.40, 0.95, 3.00],
+            [2.10, 1.70, 1.25, 0.85],
+        ]
+        metrics = compute_sequential_metrics(mock_matrix, domain_names)
+        self.assertEqual(len(metrics.transfer_matrix), 4)
+        # BWT should be negative reflecting degradation
+        self.assertLess(metrics.backward_transfer, 0.0)
+        self.assertGreater(metrics.average_forgetting, 0.0)
+        self.assertIn(domain_names[0], metrics.retention_rates)
+        self.assertIn(domain_names[3], metrics.per_domain_losses)
+
+    def test_layerwise_drift_analyzer(self) -> None:
+        model_base = CraftlyDecoderLM(self.tiny_config)
+        model_curr = CraftlyDecoderLM(self.tiny_config)
+        # Perturb attention parameters specifically
+        with torch.no_grad():
+            for name, param in model_curr.named_parameters():
+                if "attn" in name or "q_proj" in name:
+                    param.add_(0.15)
+                elif "mlp" in name:
+                    param.add_(0.05)
+
+        report = LayerwiseDriftAnalyzer.compute_drift(model_base.state_dict(), model_curr.state_dict())
+        self.assertGreater(report.mean_total_drift, 0.0)
+        self.assertGreater(report.attention_drift, report.ffn_drift)
+        self.assertIn(report.max_drift_parameter, report.layer_drifts)
+
+    def test_early_forgetting_detector(self) -> None:
+        detector = EarlyForgettingDetector(drift_threshold=0.05, velocity_threshold=0.02)
+        base_state = {"param": torch.ones(4, 4)}
+        curr_state_low = {"param": torch.ones(4, 4) + 0.01}
+        curr_state_high = {"param": torch.ones(4, 4) + 0.35}
+
+        drift_low = LayerwiseDriftAnalyzer.compute_drift(base_state, curr_state_low)
+        signal_low = detector.evaluate_step(step=50, drift_report=drift_low, reference_probe_loss=1.2)
+        self.assertFalse(signal_low.warning_triggered)
+        self.assertEqual(signal_low.risk_level, "LOW")
+
+        drift_high = LayerwiseDriftAnalyzer.compute_drift(base_state, curr_state_high)
+        signal_high = detector.evaluate_step(step=100, drift_report=drift_high, reference_probe_loss=2.5)
+        self.assertTrue(signal_high.warning_triggered)
+        self.assertIn(signal_high.risk_level, ["MODERATE", "CRITICAL"])
+
+    def test_elastic_weight_consolidation(self) -> None:
+        model = CraftlyDecoderLM(self.tiny_config)
+        samples = ["def test_func(): return 42", "class Sample: pass"]
+        fisher = ElasticWeightConsolidation.estimate_diagonal_fisher(model, samples, self.tokenizer, device="cpu")
+        self.assertGreater(len(fisher), 0)
+
+        ewc = ElasticWeightConsolidation(ewc_lambda=50.0)
+        opt_state = {k: v.clone() for k, v in model.state_dict().items()}
+        # Zero perturbation = 0 penalty
+        pen_zero = ewc.compute_penalty(model, opt_state, fisher)
+        self.assertAlmostEqual(pen_zero.item(), 0.0, places=4)
+
+        # Perturb model slightly -> positive penalty
+        with torch.no_grad():
+            for p in model.parameters():
+                p.add_(0.05)
+        pen_pos = ewc.compute_penalty(model, opt_state, fisher)
+        self.assertGreater(pen_pos.item(), 0.0)
+
+    def test_geometry_aware_layer_anchor(self) -> None:
+        gd = GeometryAwareLayerAnchor(base_replay_ratio=0.15, max_replay_ratio=0.40, anchor_stiffness=0.5)
+        w_embed = gd.compute_layer_weight("embedding.weight")
+        w_early = gd.compute_layer_weight("layers.0.mlp.down_proj.weight")
+        w_late = gd.compute_layer_weight("layers.3.mlp.down_proj.weight")
+
+        # Earlier layers must have higher stiffness than late layers
+        self.assertGreater(w_embed, w_late)
+        self.assertGreater(w_early, w_late)
+
+        # Dynamic replay scale with velocity
+        r_low = gd.get_dynamic_replay_ratio(drift_velocity=0.01)
+        r_high = gd.get_dynamic_replay_ratio(drift_velocity=0.20)
+        self.assertGreater(r_high, r_low)
+        self.assertLessEqual(r_high, 0.40)
 
 
 if __name__ == "__main__":
